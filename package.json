@@ -1,6 +1,6 @@
 {
   "name": "asktian-sdk",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "description": "Official JavaScript/TypeScript SDK for the askTIAN Metaphysics API — 33 divination systems including Qimen Dunjia, Jyotish, Ifá, Tarot, Runes, Numerology, and TIAN Blended synthesis endpoints.",
   "main": "./dist/index.js",
   "module": "./dist/index.mjs",

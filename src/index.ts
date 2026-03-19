@@ -5,9 +5,17 @@
  *   import { AskTianClient } from "asktian-sdk";
  *   const client = new AskTianClient({ apiKey: "YOUR_API_KEY" });
  *   const result = await client.qimen.calculate({ date: "2026-03-19", time: "10:00", question: "..." });
+ *
+ *   // Streaming blended reading
+ *   for await (const event of client.tian.eastern.stream({ birthdate: "1990-01-15" })) {
+ *     if (event.type === "system")          console.log(event.name, event.score);
+ *     if (event.type === "synthesis_chunk") process.stdout.write(event.chunk);
+ *     if (event.type === "done")            console.log("Score:", event.blendedScore);
+ *   }
  */
 
 const BASE_URL = "https://api.asktian.com/trpc";
+const STREAM_BASE_URL = "https://api.asktian.com/api/stream/tian";
 
 // ── Shared types ─────────────────────────────────────────────────────────────
 
@@ -16,11 +24,48 @@ export interface AskTianClientOptions {
   apiKey: string;
   /** Override the base URL (useful for testing against a local proxy) */
   baseUrl?: string;
+  /** Override the streaming base URL */
+  streamBaseUrl?: string;
 }
 
 export interface AskTianResponse<T = unknown> {
   result: { data: { json: T } };
 }
+
+// ── Streaming event types ─────────────────────────────────────────────────────
+
+export interface TianSystemEvent {
+  type: "system";
+  name: string;
+  score: number;
+  result: unknown;
+}
+
+export interface TianSynthesisChunkEvent {
+  type: "synthesis_chunk";
+  chunk: string;
+}
+
+export interface TianDoneEvent {
+  type: "done";
+  blendedScore: number;
+  creditsUsed: number;
+  systemCount: number;
+  durationMs: number;
+  traditionScores?: Record<string, number>;
+}
+
+export interface TianErrorEvent {
+  type: "error";
+  message: string;
+  code: string;
+}
+
+export type TianStreamEvent =
+  | TianSystemEvent
+  | TianSynthesisChunkEvent
+  | TianDoneEvent
+  | TianErrorEvent;
 
 // ── Input types ───────────────────────────────────────────────────────────────
 
@@ -33,6 +78,7 @@ export interface DateTimeInput {
 export interface BirthdateInput {
   birthdate: string;  // YYYY-MM-DD
   question?: string;
+  [key: string]: unknown;
 }
 
 export interface BirthdateTimeInput {
@@ -40,6 +86,7 @@ export interface BirthdateTimeInput {
   birthTime?: string;
   birthPlace?: string;
   question?: string;
+  [key: string]: unknown;
 }
 
 export interface CompatibilityInput {
@@ -112,10 +159,12 @@ export interface BloodtypeInput {
 class AskTianBase {
   protected readonly apiKey: string;
   protected readonly baseUrl: string;
+  protected readonly streamBaseUrl: string;
 
   constructor(options: AskTianClientOptions) {
     this.apiKey = options.apiKey;
     this.baseUrl = options.baseUrl ?? BASE_URL;
+    this.streamBaseUrl = options.streamBaseUrl ?? STREAM_BASE_URL;
   }
 
   protected async post<TInput, TOutput>(
@@ -142,6 +191,73 @@ class AskTianBase {
 
     const body = (await res.json()) as AskTianResponse<TOutput>;
     return body.result.data.json;
+  }
+
+  /**
+   * Open an SSE stream to a blended TIAN endpoint and yield typed events.
+   * Works in Node.js 18+ (native fetch + ReadableStream) and all modern browsers.
+   */
+  protected async *stream<TInput extends Record<string, unknown>>(
+    tradition: string,
+    input: TInput
+  ): AsyncGenerator<TianStreamEvent> {
+    const params = new URLSearchParams({ apiKey: this.apiKey });
+    for (const [k, v] of Object.entries(input)) {
+      if (v !== undefined && v !== null) params.set(k, String(v));
+    }
+
+    const url = `${this.streamBaseUrl}/${tradition}?${params.toString()}`;
+    const res = await fetch(url, {
+      headers: { Accept: "text/event-stream" },
+    });
+
+    if (!res.ok) {
+      const body = await res.json().catch(() => ({}));
+      const msg =
+        (body as { message?: string })?.message ?? `HTTP ${res.status}`;
+      throw new AskTianError(msg, res.status, body);
+    }
+
+    if (!res.body) throw new AskTianError("No response body", 0, null);
+
+    const reader = res.body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = "";
+    let currentEvent = "";
+
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+
+      buffer += decoder.decode(value, { stream: true });
+      const lines = buffer.split("\n");
+      buffer = lines.pop() ?? "";
+
+      for (const line of lines) {
+        if (line.startsWith("event: ")) {
+          currentEvent = line.slice(7).trim();
+        } else if (line.startsWith("data: ")) {
+          const raw = line.slice(6).trim();
+          try {
+            const data = JSON.parse(raw);
+            if (currentEvent === "system") {
+              yield { type: "system", name: data.name, score: data.score, result: data.result } as TianSystemEvent;
+            } else if (currentEvent === "synthesis_chunk") {
+              yield { type: "synthesis_chunk", chunk: data.chunk } as TianSynthesisChunkEvent;
+            } else if (currentEvent === "done") {
+              yield { type: "done", ...data } as TianDoneEvent;
+              return;
+            } else if (currentEvent === "error") {
+              yield { type: "error", message: data.message, code: data.code } as TianErrorEvent;
+              return;
+            }
+          } catch {
+            // malformed SSE line — skip
+          }
+          currentEvent = "";
+        }
+      }
+    }
   }
 }
 
@@ -314,27 +430,65 @@ class KhattNamespace extends AskTianBase {
   }
 }
 
+// ── TIAN Blended Namespace (with streaming) ───────────────────────────────────
+
+/**
+ * Each tradition method has two call signatures:
+ *   - `await client.tian.eastern(input)` — resolves when all systems complete
+ *   - `for await (const event of client.tian.eastern.stream(input))` — streams events progressively
+ */
+class TianTraditionMethod<TInput extends Record<string, unknown>> {
+  private readonly _post: (input: TInput) => Promise<unknown>;
+  private readonly _stream: (input: TInput) => AsyncGenerator<TianStreamEvent>;
+
+  constructor(
+    post: (input: TInput) => Promise<unknown>,
+    streamFn: (input: TInput) => AsyncGenerator<TianStreamEvent>
+  ) {
+    this._post = post;
+    this._stream = streamFn;
+
+    // Make the instance callable as a function
+    const callable = (input: TInput) => this._post(input);
+    callable.stream = (input: TInput) => this._stream(input);
+    return callable as unknown as TianTraditionMethod<TInput>;
+  }
+
+  stream(_input: TInput): AsyncGenerator<TianStreamEvent> {
+    throw new Error("unreachable");
+  }
+}
+
 class TianNamespace extends AskTianBase {
-  eastern(input: BirthdateTimeInput) {
-    return this.post<BirthdateTimeInput, unknown>("tian.eastern", input);
-  }
-  western(input: BirthdateInput) {
-    return this.post<BirthdateInput, unknown>("tian.western", input);
-  }
-  eastwest(input: BirthdateTimeInput) {
-    return this.post<BirthdateTimeInput, unknown>("tian.eastwest", input);
-  }
-  african(input: BirthdateInput) {
-    return this.post<BirthdateInput, unknown>("tian.african", input);
-  }
-  islamic(input: BirthdateInput) {
-    return this.post<BirthdateInput, unknown>("tian.islamic", input);
-  }
-  indian(input: BirthdateTimeInput) {
-    return this.post<BirthdateTimeInput, unknown>("tian.indian", input);
-  }
-  global(input: BirthdateTimeInput) {
-    return this.post<BirthdateTimeInput, unknown>("tian.global", input);
+  readonly eastern: ((input: BirthdateTimeInput) => Promise<unknown>) & { stream: (input: BirthdateTimeInput) => AsyncGenerator<TianStreamEvent> };
+  readonly western: ((input: BirthdateInput) => Promise<unknown>) & { stream: (input: BirthdateInput) => AsyncGenerator<TianStreamEvent> };
+  readonly eastwest: ((input: BirthdateTimeInput) => Promise<unknown>) & { stream: (input: BirthdateTimeInput) => AsyncGenerator<TianStreamEvent> };
+  readonly african: ((input: BirthdateInput) => Promise<unknown>) & { stream: (input: BirthdateInput) => AsyncGenerator<TianStreamEvent> };
+  readonly islamic: ((input: BirthdateInput) => Promise<unknown>) & { stream: (input: BirthdateInput) => AsyncGenerator<TianStreamEvent> };
+  readonly indian: ((input: BirthdateTimeInput) => Promise<unknown>) & { stream: (input: BirthdateTimeInput) => AsyncGenerator<TianStreamEvent> };
+  readonly global: ((input: BirthdateTimeInput) => Promise<unknown>) & { stream: (input: BirthdateTimeInput) => AsyncGenerator<TianStreamEvent> };
+
+  constructor(options: AskTianClientOptions) {
+    super(options);
+
+    const make = <TInput extends Record<string, unknown>>(
+      procedure: string,
+      tradition: string
+    ) => {
+      const fn = (input: TInput) =>
+        this.post<TInput, unknown>(procedure, input);
+      fn.stream = (input: TInput) =>
+        this.stream<TInput>(tradition, input);
+      return fn;
+    };
+
+    this.eastern = make<BirthdateTimeInput>("tian.eastern", "eastern");
+    this.western = make<BirthdateInput>("tian.western", "western");
+    this.eastwest = make<BirthdateTimeInput>("tian.eastwest", "eastwest");
+    this.african = make<BirthdateInput>("tian.african", "african");
+    this.islamic = make<BirthdateInput>("tian.islamic", "islamic");
+    this.indian = make<BirthdateTimeInput>("tian.indian", "indian");
+    this.global = make<BirthdateTimeInput>("tian.global", "global");
   }
 }
 
@@ -349,19 +503,29 @@ class TianNamespace extends AskTianBase {
  *
  * const client = new AskTianClient({ apiKey: "at_live_your_key_here" });
  *
- * // Qimen Dunjia
+ * // Qimen Dunjia (standard call)
  * const reading = await client.qimen.calculate({
  *   date: "2026-03-19",
  *   time: "10:00",
  *   question: "Should I sign the contract today?",
  * });
  *
- * // TIAN Global synthesis
- * const global = await client.tian.global({
+ * // TIAN Global — streaming (progressive)
+ * for await (const event of client.tian.global.stream({
  *   birthdate: "1990-01-15",
  *   birthTime: "06:30",
  *   birthPlace: "Singapore",
  *   question: "Should I launch my business this quarter?",
+ * })) {
+ *   if (event.type === "system")          console.log(event.name, event.score);
+ *   if (event.type === "synthesis_chunk") process.stdout.write(event.chunk);
+ *   if (event.type === "done")            console.log("\nBlended score:", event.blendedScore);
+ * }
+ *
+ * // TIAN Global — standard (waits for full response)
+ * const global = await client.tian.global({
+ *   birthdate: "1990-01-15",
+ *   question: "Career outlook",
  * });
  * ```
  */
@@ -396,32 +560,32 @@ export class AskTianClient extends AskTianBase {
 
   constructor(options: AskTianClientOptions) {
     super(options);
-    this.qimen        = new QimenNamespace(options);
-    this.liuyao       = new LiuyaoNamespace(options);
-    this.meihua       = new MeihuaNamespace(options);
-    this.daliu        = new DaliuNamespace(options);
-    this.xiaoliu      = new XiaoliuNamespace(options);
-    this.taiyi        = new TaiyiNamespace(options);
-    this.nameAnalysis = new NameAnalysisNamespace(options);
+    this.qimen         = new QimenNamespace(options);
+    this.liuyao        = new LiuyaoNamespace(options);
+    this.meihua        = new MeihuaNamespace(options);
+    this.daliu         = new DaliuNamespace(options);
+    this.xiaoliu       = new XiaoliuNamespace(options);
+    this.taiyi         = new TaiyiNamespace(options);
+    this.nameAnalysis  = new NameAnalysisNamespace(options);
     this.compatibility = new CompatibilityNamespace(options);
-    this.auspicious   = new AuspiciousNamespace(options);
-    this.almanac      = new AlmanacNamespace(options);
-    this.divination   = new DivinationNamespace(options);
-    this.astrology    = new AstrologyNamespace(options);
-    this.tarot        = new TarotNamespace(options);
-    this.coinFlip     = new CoinFlipNamespace(options);
-    this.runes        = new RunesNamespace(options);
-    this.numerology   = new NumerologyNamespace(options);
-    this.zodiac       = new ZodiacNamespace(options);
-    this.birthday     = new BirthdayNamespace(options);
-    this.bloodtype    = new BloodtypeNamespace(options);
-    this.jyotish      = new JyotishNamespace(options);
-    this.ifa          = new IfaNamespace(options);
-    this.vodun        = new VodunNamespace(options);
-    this.hakata       = new HakataNamespace(options);
-    this.rammal       = new RammalNamespace(options);
-    this.anka         = new AnkaNamespace(options);
-    this.khatt        = new KhattNamespace(options);
-    this.tian         = new TianNamespace(options);
+    this.auspicious    = new AuspiciousNamespace(options);
+    this.almanac       = new AlmanacNamespace(options);
+    this.divination    = new DivinationNamespace(options);
+    this.astrology     = new AstrologyNamespace(options);
+    this.tarot         = new TarotNamespace(options);
+    this.coinFlip      = new CoinFlipNamespace(options);
+    this.runes         = new RunesNamespace(options);
+    this.numerology    = new NumerologyNamespace(options);
+    this.zodiac        = new ZodiacNamespace(options);
+    this.birthday      = new BirthdayNamespace(options);
+    this.bloodtype     = new BloodtypeNamespace(options);
+    this.jyotish       = new JyotishNamespace(options);
+    this.ifa           = new IfaNamespace(options);
+    this.vodun         = new VodunNamespace(options);
+    this.hakata        = new HakataNamespace(options);
+    this.rammal        = new RammalNamespace(options);
+    this.anka          = new AnkaNamespace(options);
+    this.khatt         = new KhattNamespace(options);
+    this.tian          = new TianNamespace(options);
   }
 }
