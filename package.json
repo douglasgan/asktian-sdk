@@ -1,0 +1,52 @@
+{
+  "name": "asktian-sdk",
+  "version": "1.0.0",
+  "description": "Official JavaScript/TypeScript SDK for the askTIAN Metaphysics API — 33 divination systems including Qimen Dunjia, Jyotish, Ifá, Tarot, Runes, Numerology, and TIAN Blended synthesis endpoints.",
+  "main": "./dist/index.js",
+  "module": "./dist/index.mjs",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "import": "./dist/index.mjs",
+      "require": "./dist/index.js",
+      "types": "./dist/index.d.ts"
+    }
+  },
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "build": "tsc && node scripts/build-esm.js",
+    "prepublishOnly": "npm run build"
+  },
+  "keywords": [
+    "asktian",
+    "metaphysics",
+    "divination",
+    "qimen",
+    "jyotish",
+    "ifa",
+    "tarot",
+    "numerology",
+    "astrology",
+    "runes",
+    "tian",
+    "api",
+    "sdk"
+  ],
+  "author": "AskTian <douglas@asktian.com>",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/douglasgan/asktian-sdk"
+  },
+  "homepage": "https://asktian.com",
+  "bugs": {
+    "url": "https://github.com/douglasgan/asktian-sdk/issues"
+  },
+  "devDependencies": {
+    "typescript": "^5.9.3"
+  }
+}
